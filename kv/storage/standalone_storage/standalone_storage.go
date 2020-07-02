@@ -45,7 +45,7 @@ func (s *StandAloneStorage) Stop() error {
 func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, error) {
 	// Your Code Here (1).
 	var (
-		kvTxn = s.engine.Kv.NewTransaction(false)
+		kvTxn   = s.engine.Kv.NewTransaction(false)
 		raftTxn = s.engine.Raft.NewTransaction(false)
 	)
 	return &StandAloneReader{
@@ -66,7 +66,7 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 			} else {
 				txn = s.engine.Kv.NewTransaction(true)
 			}
-			err :=  txn.Set(engine_util.KeyWithCF(put.Cf, put.Key), put.Value)
+			err := txn.Set(engine_util.KeyWithCF(put.Cf, put.Key), put.Value)
 			if err != nil {
 				return err
 			}
