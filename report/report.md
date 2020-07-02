@@ -20,3 +20,16 @@ type StorageReader interface {
 	Close()
 }
 ```
+
+查看代码可以看到除了 `StandAloneStorage` 还有 `RaftStorage` 和 `MemStorage` 
+实现了 `Storage` 接口，`MemStorage` 并不以 `badgers` 为底层键值存储引擎，主要是用于测试，不过 `RaftStorage` 
+的实现是可以参考的。
+
+Project1还是比较容易的，需要注意的是：
+- `StandAloneStorage` 在实现 `Write` 接口时调用 transaction 的 Set 方法的时候应当传入 `${cf}_${key}` 的形式，
+因为读取的时候使用的 `GetCFFromTxn` 方法是将 `${cf}_${key}` 作为键的。
+
+## Project 2
+
+### Part A
+
