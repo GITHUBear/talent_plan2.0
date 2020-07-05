@@ -160,6 +160,9 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	stepFunc func(m pb.Message) error
+	tickFunc func()
 }
 
 // newRaft return a raft peer with the given config
@@ -168,13 +171,22 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+	prs := make(map[uint64]*Progress)
+	for i := 1; i <= len(c.peers); i++ {
+		prs[uint64(i)] = nil
+	}
 	raft := &Raft{
 		id:               c.ID,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
-		Lead:             None,
+		Prs:              prs,
 	}
+	raft.becomeFollower(0, None)
 	return raft
+}
+
+func (r *Raft) send(m pb.Message) {
+	r.msgs = append(r.msgs, m)
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -187,14 +199,44 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	r.send(m)
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.tickFunc()
 }
 
-//
+// tickElection is the logical clock for Follower and Candidate.
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.randomElectionTimeout {
+		r.electionElapsed = 0
+		//log.Infof("Node %d election timeout.", r.id)
+		// send local message `MessageType_MsgHup` to become Candidate and start a election
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup, From: r.id})
+	}
+}
+
+// tickHeartbeat is the logical clock for Leader.
+func (r *Raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		log.Infof("Node %d heartbeat timeout.", r.id)
+		// send local message `MessageType_MsgBeat` to notify Leader.
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat, From: r.id})
+	}
+}
+
+// reset Term/Vote/Lead and recalculate election timeout.
 func (r *Raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -205,7 +247,7 @@ func (r *Raft) reset(term uint64) {
 	r.heartbeatElapsed = 0
 	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 
-	r.votes = make(map[uint64]bool)
+	r.votes = make(map[uint64]bool, 0)
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -213,6 +255,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	r.reset(term)
 	r.State = StateFollower
+	r.tickFunc = r.tickElection
+	r.stepFunc = r.stepFollower
 
 	r.Lead = lead
 	log.Infof("Node %d become follower at term %d", r.id, r.Term)
@@ -223,6 +267,8 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	r.reset(r.Term + 1)
 	r.State = StateCandidate
+	r.tickFunc = r.tickElection
+	r.stepFunc = r.stepCandidate
 
 	r.Vote = r.id
 	r.votes[r.id] = true
@@ -235,6 +281,8 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.reset(r.Term)
 	r.State = StateLeader
+	r.tickFunc = r.tickHeartbeat
+	r.stepFunc = r.stepLeader
 
 	r.Lead = r.id
 	log.Infof("Node %d become leader at term %d", r.id, r.Term)
@@ -244,10 +292,45 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-	case StateCandidate:
-	case StateLeader:
+	switch {
+	case m.Term == 0:
+		// local message
+	case m.Term > r.Term:
+		log.Infof("Node %d (Term: %d) received a message with greater Term %d", r.id, r.Term, m.Term)
+		r.becomeFollower(m.Term, m.From)
+	case m.Term < r.Term:
+		// ignore this message
+		log.Infof("Node %d (Term: %d) ignored a message with Term: %d", r.id, r.Term, m.Term)
+		return nil
+	}
+	r.stepFunc(m)
+	return nil
+}
+
+// Message handler for Follower
+func (r *Raft) stepFollower(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+
+	}
+	return nil
+}
+
+// Message handler for Candidate
+func (r *Raft) stepCandidate(m pb.Message) error {
+	return nil
+}
+
+// Message handler for Leader
+func (r *Raft) stepLeader(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		for i := 1; i <= len(r.Prs); i++ {
+			if uint64(i) == r.id {
+				continue
+			}
+			r.sendHeartbeat(uint64(i))
+		}
 	}
 	return nil
 }
