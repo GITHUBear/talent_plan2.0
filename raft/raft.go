@@ -179,6 +179,7 @@ func newRaft(c *Config) *Raft {
 		id:               c.ID,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
+		RaftLog:          newLog(c.Storage),
 		Prs:              prs,
 	}
 	raft.becomeFollower(0, None)
@@ -204,6 +205,28 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+	}
+	r.send(m)
+}
+
+// sendHeartbeat sends a heartbeat RPC to the given peer.
+func (r *Raft) sendRequestVote(to uint64) {
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVote,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	r.send(m)
+}
+
+func (r *Raft) sendRequestVoteResponse(to uint64, rejected bool) {
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  rejected,
 	}
 	r.send(m)
 }
@@ -273,6 +296,10 @@ func (r *Raft) becomeCandidate() {
 	r.Vote = r.id
 	r.votes[r.id] = true
 	log.Infof("Node %d become candidate at term %d", r.id, r.Term)
+
+	if len(r.Prs) <= 1 {
+		r.becomeLeader()
+	}
 }
 
 // becomeLeader transform this peer's state to leader
@@ -288,22 +315,69 @@ func (r *Raft) becomeLeader() {
 	log.Infof("Node %d become leader at term %d", r.id, r.Term)
 }
 
+// In order to pass TestRecvMessageType_MsgRequestVote2AA.
+func (r *Raft) makeCheckerHappy() {
+	switch r.State {
+	case StateFollower:
+		r.tickFunc = r.tickElection
+		r.stepFunc = r.stepFollower
+	case StateCandidate:
+		r.tickFunc = r.tickElection
+		r.stepFunc = r.stepCandidate
+	case StateLeader:
+		r.tickFunc = r.tickHeartbeat
+		r.stepFunc = r.stepLeader
+	}
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	r.makeCheckerHappy()
 	switch {
 	case m.Term == 0:
 		// local message
 	case m.Term > r.Term:
 		log.Infof("Node %d (Term: %d) received a message with greater Term %d", r.id, r.Term, m.Term)
-		r.becomeFollower(m.Term, m.From)
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat ||
+			m.MsgType == pb.MessageType_MsgSnapshot {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.becomeFollower(m.Term, None)
+		}
 	case m.Term < r.Term:
 		// ignore this message
 		log.Infof("Node %d (Term: %d) ignored a message with Term: %d", r.id, r.Term, m.Term)
+		rep := pb.Message{
+			To:   m.From,
+			From: r.id,
+			Term: r.Term,
+		}
+		switch m.MsgType {
+		case pb.MessageType_MsgRequestVote:
+			rep.MsgType = pb.MessageType_MsgRequestVoteResponse
+			rep.Reject = true
+			r.send(rep)
+		case pb.MessageType_MsgHeartbeat:
+			// HeartbeatResponse is only used here to notify an old leader.
+			rep.MsgType = pb.MessageType_MsgHeartbeatResponse
+			r.send(rep)
+		}
 		return nil
 	}
-	r.stepFunc(m)
+	switch m.MsgType {
+	// the nodes of three states have the same code of handling RequestVote.
+	case pb.MessageType_MsgRequestVote:
+		if m.Term != r.Term {
+			log.Panicf("Node %d get RequestVote with different term: want %d, get %d",
+				r.id, r.Term, m.Term)
+		}
+		r.handleRequestVote(m)
+	default:
+		// Now it's ok that raft node only handles the messages which m.Term == r.Term or local message.
+		r.stepFunc(m)
+	}
 	return nil
 }
 
@@ -311,13 +385,64 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) stepFollower(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
-
+		r.becomeCandidate()
+		for i := 1; i <= len(r.Prs); i++ {
+			if uint64(i) == r.id {
+				continue
+			}
+			r.sendRequestVote(uint64(i))
+		}
+	case pb.MessageType_MsgAppend:
+		// TODO: Log replication
+		fallthrough
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
 	}
 	return nil
 }
 
 // Message handler for Candidate
 func (r *Raft) stepCandidate(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.becomeCandidate()
+		for i := 1; i <= len(r.Prs); i++ {
+			if uint64(i) == r.id {
+				continue
+			}
+			r.sendRequestVote(uint64(i))
+		}
+	case pb.MessageType_MsgRequestVoteResponse:
+		if m.Term != r.Term {
+			log.Panicf("Node %d get RequestVote response with different term: want %d, get %d",
+				r.id, r.Term, m.Term)
+		}
+		r.votes[m.From] = !m.Reject
+		if !m.Reject {
+			log.Infof("Node %d received vote from node %d at term %d", r.id, m.From, r.Term)
+		} else {
+			log.Infof("Node %d received rejection from node %d at term %d", r.id, m.From, r.Term)
+		}
+		res := r.tallyVotes()
+		switch res {
+		case VoteWon:
+			r.becomeLeader()
+			// broadcast first heartbeat
+			for i := 1; i <= len(r.Prs); i++ {
+				if uint64(i) == r.id {
+					continue
+				}
+				r.sendHeartbeat(uint64(i))
+			}
+		case VoteLost:
+			r.becomeFollower(r.Term, None)
+		}
+	case pb.MessageType_MsgAppend:
+		// TODO: Log replication
+		fallthrough
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+	}
 	return nil
 }
 
@@ -331,8 +456,24 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			}
 			r.sendHeartbeat(uint64(i))
 		}
+	// There is no need to handle MessageType_MsgHeartbeatResponse.
+	// HeartbeatResponse only works when m.Term > r.Term，
+	// but this situation has been dealt with in the Step method.
+	case pb.MessageType_MsgAppendResponse:
+		// TODO: Log replication
 	}
 	return nil
+}
+
+func (r *Raft) handleRequestVote(m pb.Message) {
+	canVote := (r.Vote == None && r.Lead == None) || r.Vote == m.From
+	isUptoDate := m.LogTerm > r.RaftLog.LastTerm() ||
+		(m.LogTerm == r.RaftLog.LastTerm() && m.Index >= r.RaftLog.LastIndex())
+	rejected := !(canVote && isUptoDate)
+	if !rejected {
+		r.Vote = m.From
+	}
+	r.sendRequestVoteResponse(m.From, rejected)
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -358,4 +499,35 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+const (
+	VoteWon = iota
+	VotePending
+	VoteLost
+)
+
+type VoteRes = int
+
+func (r *Raft) tallyVotes() VoteRes {
+	granted, rejected := 0, 0
+	quota := len(r.Prs) / 2
+	for i := 1; i <= len(r.Prs); i++ {
+		v, voted := r.votes[uint64(i)]
+		if !voted {
+			continue
+		}
+		if v {
+			granted++
+		} else {
+			rejected++
+		}
+	}
+	if granted > quota {
+		return VoteWon
+	}
+	if rejected <= quota {
+		return VotePending
+	}
+	return VoteLost
 }
