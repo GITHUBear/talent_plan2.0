@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/gogo/protobuf/sortkeys"
 	"github.com/pingcap-incubator/tinykv/log"
 	"math/rand"
 
@@ -194,7 +195,48 @@ func (r *Raft) send(m pb.Message) {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	li := r.RaftLog.LastIndex()
+	ents := make([]*pb.Entry, 0)
+	var logTerm, idx uint64
+	if li < r.Prs[to].Next {
+		return false
+		//noop := pb.Entry{
+		//	EntryType: pb.EntryType_EntryNormal,
+		//	Term:      r.RaftLog.LastTerm(),
+		//	Index:     li,
+		//	Data:      nil,
+		//}
+		//logTerm = noop.Term
+		//idx = li
+		//ents = append(ents, &noop)
+	} else {
+		entries, err := r.RaftLog.GetEntries(r.Prs[to].Next)
+		if err != nil {
+			panic(err)
+		}
+		idx = r.Prs[to].Next - 1
+		logTerm, err = r.RaftLog.Term(idx)
+		if err != nil {
+			panic(err)
+		}
+		for _, v := range entries {
+			ents = append(ents, &v)
+		}
+		log.Infof("Node %d prepare AppendMsg for Node %d: %v %v (start with idx %d)",
+			r.id, to, ents, entries, r.Prs[to].Next)
+	}
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: logTerm,
+		Index:   idx,
+		Entries: ents,
+		Commit:  r.RaftLog.committed,
+	}
+	r.send(m)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -216,6 +258,7 @@ func (r *Raft) sendRequestVote(to uint64) {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		LogTerm: r.RaftLog.LastTerm(),
 	}
 	r.send(m)
 }
@@ -242,7 +285,7 @@ func (r *Raft) tickElection() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomElectionTimeout {
 		r.electionElapsed = 0
-		//log.Infof("Node %d election timeout.", r.id)
+		log.Infof("Node %d election timeout.", r.id)
 		// send local message `MessageType_MsgHup` to become Candidate and start a election
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup, From: r.id})
 	}
@@ -312,6 +355,20 @@ func (r *Raft) becomeLeader() {
 	r.stepFunc = r.stepLeader
 
 	r.Lead = r.id
+	for i := range r.Prs {
+		if i == r.id {
+			r.Prs[i] = nil
+		} else {
+			r.Prs[i] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+		}
+	}
+	// append a noop entry on its term
+	//r.appendEntries([]*pb.Entry{
+	//	{
+	//		EntryType: pb.EntryType_EntryNormal,
+	//		Data:      nil,
+	//	},
+	//}...)
 	log.Infof("Node %d become leader at term %d", r.id, r.Term)
 }
 
@@ -376,7 +433,7 @@ func (r *Raft) Step(m pb.Message) error {
 		r.handleRequestVote(m)
 	default:
 		// Now it's ok that raft node only handles the messages which m.Term == r.Term or local message.
-		r.stepFunc(m)
+		return r.stepFunc(m)
 	}
 	return nil
 }
@@ -456,13 +513,100 @@ func (r *Raft) stepLeader(m pb.Message) error {
 			}
 			r.sendHeartbeat(uint64(i))
 		}
+	case pb.MessageType_MsgPropose:
+		// appends the proposal to its log as a new entry
+		log.Infof("before append entry: unstable: %v new_entries_len: %d li: %d",
+			r.RaftLog.entries, len(m.Entries), r.RaftLog.LastIndex())
+		r.appendEntries(m.Entries...)
+		log.Infof("after append entry: unstable: %v", r.RaftLog.entries)
+		// broadcast Append message
+		for i := 1; i <= len(r.Prs); i++ {
+			if uint64(i) == r.id {
+				continue
+			}
+			r.sendAppend(uint64(i))
+		}
 	// There is no need to handle MessageType_MsgHeartbeatResponse.
 	// HeartbeatResponse only works when m.Term > r.Term，
 	// but this situation has been dealt with in the Step method.
 	case pb.MessageType_MsgAppendResponse:
-		// TODO: Log replication
+		// TODO: Update Progress
+		prs := r.Prs[m.From]
+		if m.Reject {
+			// ignore append responses that arrive late because of communication delay
+			if m.Index == prs.Next-1 {
+				// not a stale append response
+				// decrease Next by 1 for now. (TODO) add index hint
+				prs.Next = m.Index
+				if prs.Next < 1 {
+					prs.Next = 1
+				}
+				log.Infof("Leader Node %d receives a rejection append response, update Node %d Next -> %d",
+					r.id, m.From, prs.Next)
+				r.sendAppend(m.From)
+			}
+		} else {
+			// ignore stale response
+			// match, update Match
+			if m.Index > prs.Match {
+				prs.Match = m.Index
+				prs.Next = m.Index + 1
+				log.Infof("Leader Node %d receives a match append response, update Node %d (Match,Next) -> (%d,%d)",
+					r.id, m.From, prs.Match, prs.Next)
+				if r.MaybeUpdateCommit() {
+					// broadcast Append message
+					for i := 1; i <= len(r.Prs); i++ {
+						if uint64(i) == r.id {
+							continue
+						}
+						r.sendAppend(uint64(i))
+					}
+				}
+			}
+		}
 	}
 	return nil
+}
+
+func (r *Raft) MaybeUpdateCommit() bool {
+	matches := make([]uint64, len(r.Prs))
+	for i, prs := range r.Prs {
+		if i == r.id {
+			matches[i-1] = r.RaftLog.LastIndex()
+		} else {
+			matches[i-1] = prs.Match
+		}
+	}
+
+	sortkeys.Uint64s(matches)
+	mid := matches[(len(matches)-1)/2]
+	log.Infof("[MaybeUpdayeCommit] matches: %v mid: %d", matches, mid)
+	if mid > r.RaftLog.LastIndex() || mid <= r.RaftLog.committed {
+		return false
+	}
+	midTerm, err := r.RaftLog.Term(mid)
+	if err != nil {
+		log.Errorf("[MaybeUpdateCommit] raftlog term call error")
+		return false
+	}
+	if midTerm != r.Term {
+		return false
+	}
+	log.Infof("Node %d update commit index from %d to %d", r.id, r.RaftLog.committed, mid)
+	r.RaftLog.committed = mid
+	return true
+}
+
+//
+func (r *Raft) appendEntries(entries ...*pb.Entry) {
+	lastIdx := r.RaftLog.LastIndex()
+	ents := make([]pb.Entry, 0)
+	for i := range entries {
+		entries[i].Index = lastIdx + 1 + uint64(i)
+		entries[i].Term = r.Term
+		ents = append(ents, *entries[i])
+	}
+	r.RaftLog.append(ents...)
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
