@@ -120,7 +120,6 @@ func (l *RaftLog) append(entries ...pb.Entry) {
 	if preIdx < l.committed {
 		log.Panicf("Appending entries with index(%d) <= committed(%d) is invalid.", preIdx+1, l.committed)
 	}
-	// TODO: Use switch statement only and use fallthrough
 	if len(l.entries) > 0 {
 		switch {
 		case preIdx == l.offset+uint64(len(l.entries)-1):

@@ -173,15 +173,20 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	prs := make(map[uint64]*Progress)
-	for i := 1; i <= len(c.peers); i++ {
-		prs[uint64(i)] = nil
-	}
 	raft := &Raft{
 		id:               c.ID,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
 		RaftLog:          newLog(c.Storage),
 		Prs:              prs,
+	}
+	li := raft.RaftLog.LastIndex()
+	for i := 1; i <= len(c.peers); i++ {
+		if uint64(i) == raft.id {
+			raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: li}
+		} else {
+			raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: 0}
+		}
 	}
 	raft.becomeFollower(0, None)
 	state, _, _ := raft.RaftLog.storage.InitialState()
@@ -240,17 +245,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	commit := min(r.RaftLog.committed, r.Prs[to].Match)
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
-		// TODO: Add logTerm/Index/Commit
+		Commit:  commit,
 	}
 	r.send(m)
 }
 
-// sendHeartbeat sends a heartbeat RPC to the given peer.
+// sendRequestVote sends a RequestVote RPC to the given peer.
 func (r *Raft) sendRequestVote(to uint64) {
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
@@ -467,6 +473,13 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
+		if m.Commit > r.RaftLog.committed {
+			if r.RaftLog.LastIndex() < m.Commit {
+				log.Panicf("Heartbeat commitIdx(%d) out of lastIdx(%d) ---- Dangerous case!",
+					m.Commit, r.RaftLog.LastIndex())
+			}
+			r.RaftLog.committed = m.Commit
+		}
 	}
 	return nil
 }
@@ -508,9 +521,17 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgAppend:
-		fallthrough
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
+		if m.Commit > r.RaftLog.committed {
+			if r.RaftLog.LastIndex() < m.Commit {
+				log.Panicf("Heartbeat commitIdx(%d) out of lastIdx(%d) ---- Dangerous case!",
+					m.Commit, r.RaftLog.LastIndex())
+			}
+			r.RaftLog.committed = m.Commit
+		}
 	}
 	return nil
 }
