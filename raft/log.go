@@ -61,7 +61,20 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return &RaftLog{storage: storage}
+	sli, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	sfi, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	ents, err := storage.Entries(sfi, sli+1)
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("offset(first): %d  stabled(last): %d  ents: %v", sfi, sli, ents)
+	return &RaftLog{storage: storage, stabled: sli, entries: ents, offset: sfi}
 }
 
 // We need to compact the log entries in some point of time like
@@ -74,19 +87,24 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if l.stabled+1 < l.offset {
-		log.Panicf("stable(%d) + 1 < offset(%d) is invalid", l.stabled, l.offset)
+	if l.stabled+1 > l.LastIndex() {
+		// all entries is stabled
+		return make([]pb.Entry, 0)
 	}
-	log.Infof("offset: %d stabled:%d entries:%v", l.offset, l.stabled, l.entries)
-	if len(l.entries) == 0 {
-		return nil
+	ents, err := l.Slice(l.stabled+1, l.LastIndex()+1)
+	if err != nil {
+		panic(err)
 	}
-	return l.entries[l.stabled+1-l.offset:]
+	return ents
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if l.applied+1 > l.LastIndex() {
+		// all entries is applied
+		return make([]pb.Entry, 0)
+	}
 	ents, err := l.Slice(l.applied+1, l.committed+1)
 	if err != nil {
 		panic(err)
@@ -117,6 +135,9 @@ func (l *RaftLog) append(entries ...pb.Entry) {
 	} else {
 		l.offset = preIdx + 1
 		l.entries = entries
+	}
+	if l.stabled > preIdx {
+		l.stabled = preIdx
 	}
 }
 

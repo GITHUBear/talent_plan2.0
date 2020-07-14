@@ -184,6 +184,8 @@ func newRaft(c *Config) *Raft {
 		Prs:              prs,
 	}
 	raft.becomeFollower(0, None)
+	state, _, _ := raft.RaftLog.storage.InitialState()
+	raft.Term, raft.Vote, raft.RaftLog.committed = state.Term, state.Vote, state.Commit
 	return raft
 }
 
@@ -199,16 +201,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 	ents := make([]*pb.Entry, 0)
 	var logTerm, idx uint64
 	if li < r.Prs[to].Next {
-		return false
-		//noop := pb.Entry{
-		//	EntryType: pb.EntryType_EntryNormal,
-		//	Term:      r.RaftLog.LastTerm(),
-		//	Index:     li,
-		//	Data:      nil,
-		//}
-		//logTerm = noop.Term
-		//idx = li
-		//ents = append(ents, &noop)
+		if li+1 != r.Prs[to].Next {
+			panic("[sendAppend] assertion failure")
+		}
+		logTerm = r.RaftLog.LastTerm()
+		idx = li
 	} else {
 		entries, err := r.RaftLog.GetEntries(r.Prs[to].Next)
 		if err != nil {
@@ -220,7 +217,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 			panic(err)
 		}
 		for _, v := range entries {
-			ents = append(ents, &v)
+			tmp := v
+			ents = append(ents, &tmp)
 		}
 		log.Infof("Node %d prepare AppendMsg for Node %d: %v %v (start with idx %d)",
 			r.id, to, ents, entries, r.Prs[to].Next)
@@ -247,6 +245,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		// TODO: Add logTerm/Index/Commit
 	}
 	r.send(m)
 }
@@ -259,6 +258,7 @@ func (r *Raft) sendRequestVote(to uint64) {
 		From:    r.id,
 		Term:    r.Term,
 		LogTerm: r.RaftLog.LastTerm(),
+		Index:   r.RaftLog.LastIndex(),
 	}
 	r.send(m)
 }
@@ -325,7 +325,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.stepFunc = r.stepFollower
 
 	r.Lead = lead
-	log.Infof("Node %d become follower at term %d", r.id, r.Term)
+	log.Infof("Node %d become follower at term %d (leader: %d)", r.id, r.Term, r.Lead)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -349,27 +349,41 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
-	r.reset(r.Term)
-	r.State = StateLeader
-	r.tickFunc = r.tickHeartbeat
-	r.stepFunc = r.stepLeader
+	if r.State != StateLeader {
+		r.reset(r.Term)
+		r.State = StateLeader
+		r.tickFunc = r.tickHeartbeat
+		r.stepFunc = r.stepLeader
 
-	r.Lead = r.id
-	for i := range r.Prs {
-		if i == r.id {
-			r.Prs[i] = nil
+		r.Lead = r.id
+		li := r.RaftLog.LastIndex()
+		for i := range r.Prs {
+			if i == r.id {
+				r.Prs[i] = &Progress{Next: li + 1, Match: li}
+			} else {
+				r.Prs[i] = &Progress{Next: li + 1, Match: 0}
+			}
+		}
+		// append a noop entry on its term
+		r.appendEntries([]*pb.Entry{
+			{
+				EntryType: pb.EntryType_EntryNormal,
+				Data:      nil,
+			},
+		}...)
+		log.Infof("Node %d become leader at term %d", r.id, r.Term)
+		// broadcast Append message
+		if len(r.Prs) == 1 {
+			r.MaybeUpdateCommit()
 		} else {
-			r.Prs[i] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+			for i := 1; i <= len(r.Prs); i++ {
+				if uint64(i) == r.id {
+					continue
+				}
+				r.sendAppend(uint64(i))
+			}
 		}
 	}
-	// append a noop entry on its term
-	//r.appendEntries([]*pb.Entry{
-	//	{
-	//		EntryType: pb.EntryType_EntryNormal,
-	//		Data:      nil,
-	//	},
-	//}...)
-	log.Infof("Node %d become leader at term %d", r.id, r.Term)
 }
 
 // In order to pass TestRecvMessageType_MsgRequestVote2AA.
@@ -450,8 +464,7 @@ func (r *Raft) stepFollower(m pb.Message) error {
 			r.sendRequestVote(uint64(i))
 		}
 	case pb.MessageType_MsgAppend:
-		// TODO: Log replication
-		fallthrough
+		r.handleAppendEntries(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
 	}
@@ -495,7 +508,6 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgAppend:
-		// TODO: Log replication
 		fallthrough
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
@@ -515,22 +527,25 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		}
 	case pb.MessageType_MsgPropose:
 		// appends the proposal to its log as a new entry
-		log.Infof("before append entry: unstable: %v new_entries_len: %d li: %d",
-			r.RaftLog.entries, len(m.Entries), r.RaftLog.LastIndex())
+		log.Infof("Leader %d before append entry: unstable: %v new_entries_len: %d li: %d",
+			r.id, r.RaftLog.entries, len(m.Entries), r.RaftLog.LastIndex())
 		r.appendEntries(m.Entries...)
-		log.Infof("after append entry: unstable: %v", r.RaftLog.entries)
+		log.Infof("Leader %d after append entry: unstable: %v", r.id, r.RaftLog.entries)
 		// broadcast Append message
-		for i := 1; i <= len(r.Prs); i++ {
-			if uint64(i) == r.id {
-				continue
+		if len(r.Prs) == 1 {
+			r.MaybeUpdateCommit()
+		} else {
+			for i := 1; i <= len(r.Prs); i++ {
+				if uint64(i) == r.id {
+					continue
+				}
+				r.sendAppend(uint64(i))
 			}
-			r.sendAppend(uint64(i))
 		}
 	// There is no need to handle MessageType_MsgHeartbeatResponse.
 	// HeartbeatResponse only works when m.Term > r.Term，
 	// but this situation has been dealt with in the Step method.
 	case pb.MessageType_MsgAppendResponse:
-		// TODO: Update Progress
 		prs := r.Prs[m.From]
 		if m.Reject {
 			// ignore append responses that arrive late because of communication delay
@@ -554,7 +569,7 @@ func (r *Raft) stepLeader(m pb.Message) error {
 				log.Infof("Leader Node %d receives a match append response, update Node %d (Match,Next) -> (%d,%d)",
 					r.id, m.From, prs.Match, prs.Next)
 				if r.MaybeUpdateCommit() {
-					// broadcast Append message
+					// update followers' commit index
 					for i := 1; i <= len(r.Prs); i++ {
 						if uint64(i) == r.id {
 							continue
@@ -607,6 +622,10 @@ func (r *Raft) appendEntries(entries ...*pb.Entry) {
 		ents = append(ents, *entries[i])
 	}
 	r.RaftLog.append(ents...)
+	// Update Leader progress to pass tests
+	prs := r.Prs[r.id]
+	prs.Match = r.RaftLog.LastIndex()
+	prs.Next = prs.Match + 1
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
@@ -614,6 +633,8 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	isUptoDate := m.LogTerm > r.RaftLog.LastTerm() ||
 		(m.LogTerm == r.RaftLog.LastTerm() && m.Index >= r.RaftLog.LastIndex())
 	rejected := !(canVote && isUptoDate)
+	log.Infof("Node %d handle requestVote rpc from Node %d: canVote: %v, isUptoData: %v (m.LogTerm:%d, m.Index:%d, lastTerm:%d, lastIndex:%d)",
+		r.id, m.From, canVote, isUptoDate, m.LogTerm, m.Index, r.RaftLog.LastTerm(), r.RaftLog.LastIndex())
 	if !rejected {
 		r.Vote = m.From
 	}
@@ -623,6 +644,56 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	if r.Lead == None && r.Term == m.Term && r.Vote == m.From {
+		r.Lead = m.From
+	}
+	response := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   m.Index,
+		Reject:  false,
+	}
+	lastNewIdx := m.Index + uint64(len(m.Entries))
+	prevIdx, prevTerm := m.Index, m.LogTerm
+	term, err := r.RaftLog.Term(prevIdx)
+	if err != nil {
+		panic(err)
+	}
+	if term != prevTerm {
+		log.Infof("Follower Node %d reject append rpc from Node %d", r.id, m.From)
+		response.Reject = true
+		r.send(response)
+		return
+	}
+	tmp := make([]pb.Entry, 0, len(m.Entries))
+	foundConflict := false
+	for _, ent := range m.Entries {
+		term, err := r.RaftLog.Term(ent.Index)
+		if err != nil {
+			panic(err)
+		}
+		if term != ent.Term {
+			foundConflict = true
+		}
+		if foundConflict {
+			tmp = append(tmp, *ent)
+		}
+	}
+	log.Infof("before append entries in follower %d: entries: %v tmp: %v [local commit: %d]",
+		r.id, r.RaftLog.entries, tmp, r.RaftLog.committed)
+	r.RaftLog.append(tmp...)
+	log.Infof("after append entries in follower %d: entries: %v", r.id, r.RaftLog.entries)
+	// match index
+	response.Index = r.RaftLog.LastIndex()
+	if r.RaftLog.committed < m.Commit {
+		log.Infof("Node %d update commit index from %d -> %d",
+			r.id, r.RaftLog.committed, min(lastNewIdx, m.Commit))
+		r.RaftLog.committed = min(lastNewIdx, m.Commit)
+	}
+	r.send(response)
+	return
 }
 
 // handleHeartbeat handle Heartbeat RPC request
