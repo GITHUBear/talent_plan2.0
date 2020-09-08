@@ -194,6 +194,26 @@ func newRaft(c *Config) *Raft {
 	return raft
 }
 
+func (r *Raft) advance(rd Ready) {
+	// update `applied` by rd.CommittedEntries
+	if n := len(rd.CommittedEntries); n > 0 {
+		newApplied := rd.CommittedEntries[n-1].Index
+		if newApplied < r.RaftLog.applied || newApplied > r.RaftLog.committed {
+			log.Panicf("[advance] new applied index %d is not in range [%d, %d]",
+				newApplied, r.RaftLog.applied, r.RaftLog.committed)
+		}
+		r.RaftLog.applied = newApplied
+		log.Infof("[advance] Node %d update applied index to %d", r.id, newApplied)
+	}
+	//
+	if len(rd.Entries) > 0 {
+		index := rd.Entries[len(rd.Entries)-1].Index
+		r.RaftLog.entries = r.RaftLog.entries[index+1-r.RaftLog.offset:]
+		r.RaftLog.offset = index + 1
+		r.RaftLog.stabled = index
+	}
+}
+
 func (r *Raft) send(m pb.Message) {
 	r.msgs = append(r.msgs, m)
 }
@@ -616,7 +636,7 @@ func (r *Raft) MaybeUpdateCommit() bool {
 
 	sortkeys.Uint64s(matches)
 	mid := matches[(len(matches)-1)/2]
-	log.Infof("[MaybeUpdayeCommit] matches: %v mid: %d", matches, mid)
+	log.Infof("[MaybeUpdateCommit] matches: %v mid: %d", matches, mid)
 	if mid > r.RaftLog.LastIndex() || mid <= r.RaftLog.committed {
 		return false
 	}
@@ -766,4 +786,17 @@ func (r *Raft) tallyVotes() VoteRes {
 		return VotePending
 	}
 	return VoteLost
+}
+
+// ------------ APIs for rawnode.go ---------------
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }
