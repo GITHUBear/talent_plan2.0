@@ -181,15 +181,26 @@ func newRaft(c *Config) *Raft {
 		Prs:              prs,
 	}
 	li := raft.RaftLog.LastIndex()
-	for i := 1; i <= len(c.peers); i++ {
-		if uint64(i) == raft.id {
-			raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: li}
-		} else {
-			raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: 0}
+	raft.becomeFollower(0, None)
+	state, confState, _ := raft.RaftLog.storage.InitialState()
+	if len(c.peers) > 0 {
+		// for Test 2a
+		for i := 1; i <= len(c.peers); i++ {
+			if uint64(i) == raft.id {
+				raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: li}
+			} else {
+				raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: 0}
+			}
+		}
+	} else {
+		for i := range confState.Nodes {
+			if uint64(i) == raft.id {
+				raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: li}
+			} else {
+				raft.Prs[uint64(i)] = &Progress{Next: li + 1, Match: 0}
+			}
 		}
 	}
-	raft.becomeFollower(0, None)
-	state, _, _ := raft.RaftLog.storage.InitialState()
 	raft.Term, raft.Vote, raft.RaftLog.committed = state.Term, state.Vote, state.Commit
 	return raft
 }
