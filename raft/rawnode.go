@@ -166,12 +166,27 @@ func (rn *RawNode) Ready() Ready {
 	if curHardState := rn.Raft.hardState(); !isHardStateEqual(curHardState, rn.prevHardState) {
 		rd.HardState = curHardState
 	}
+	// softState is updated in place, because it does not need to be persisted
+	if rd.SoftState != nil {
+		rn.prevSoftState = rd.SoftState
+	}
+	rn.Raft.msgs = nil
 	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	r := rn.Raft
+	if !r.softState().equal(rn.prevSoftState) {
+		return true
+	}
+	if curHardState := r.hardState(); !IsEmptyHardState(curHardState) && !isHardStateEqual(curHardState, rn.prevHardState) {
+		return true
+	}
+	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || len(r.RaftLog.nextEnts()) > 0 {
+		return true
+	}
 	return false
 }
 

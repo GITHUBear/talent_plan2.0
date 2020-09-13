@@ -80,6 +80,31 @@ raftState.HardState.Commit = 5
 offset(first): 6  stabled(last): 5  ents: []
 ```
 
+Raft Node 驱动流程：
+
+```
+                          +----------------+
+    +--------------+      |                |
+    |  RaftStorage |----->|    RaftStore   |
+    +--------------+      |                |
+                          +----------------+
+                                   |
+                                   | startWorkers
+                                   V
+                           +--------------+
+                           |   RaftWorker |
+                           +--------------+
+                                   |
+                                   | newPeerMsgHandler
+                                   V
+                          +-----------------+
+                          |  peerMsgHandler |
+                          |     +---------+ |
+                          |     |   Peer  | |
+                          |     +---------+ |
+                          +-----------------+
+```
+
 #### 遇到的问题
 
 i. 在本阶段未添加任何代码的情况下运行 `make project2b`, 会得到 appendEntries 
@@ -96,4 +121,6 @@ github.com/pingcap-incubator/tinykv/raft.(*Raft).appendEntries(0xc0000f86e0, 0xc
 
 在上面的 Peer 创建流程分析中的最后一步中，在创建 Raft 的时候使用了 raft.RaftLog.storage.InitialState() 
 而这个方法调用实际返回了两个返回值 HardState 在之前的实现当中就已经用于恢复 vote、 commit index、 term，
-而之前尚未使用的 ConfState 中的 Nodes 成员应该就保存了 raft group 当中的其他成员 ID
+而之前尚未使用的 ConfState 中的 Nodes 成员应该就保存了 raft group 当中的其他成员 ID, 然后相应修改 newRaft 即可
+
+ii. 
